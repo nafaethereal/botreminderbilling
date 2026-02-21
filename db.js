@@ -4,7 +4,7 @@ const db = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",        // default Laragon
-  database: "botreminder",
+  database: "dummy_reminder",
   waitForConnections: true,
   connectionLimit: 5,
   queueLimit: 0

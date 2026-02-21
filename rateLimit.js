@@ -8,7 +8,7 @@ let queue = Promise.resolve()
 function sendSafe(sock, jid, message) {
   queue = queue.then(async () => {
     await delay(RATE_DELAY)
-    await sock.sendMessage(jid, message)
+    return await sock.sendMessage(jid, message)
   }).catch(console.error)
 
   return queue
