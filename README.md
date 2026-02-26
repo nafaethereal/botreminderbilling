@@ -12,7 +12,7 @@ Sebelum menjalankan bot, pastikan perangkat Anda sudah terinstall:
 
 ### 1. Clone Repository & Install Dependencies
 ```bash
-git clone https://github.com/nafaethereal/botreminder.git
+git clone https://github.com/nafaethereal/botreminderbilling.git
 cd botreminder
 npm install
 ```
@@ -27,13 +27,16 @@ npm install
    ```bash
    cp .env.example .env
    ```
-2. Buka file `.env` dan sesuaikan kredensial database Anda:
+3. Buka file `.env` dan sesuaikan kredensial database serta API Key:
    ```env
    DB_HOST=localhost
    DB_USER=root
    DB_PASS=
    DB_NAME=dummy_reminder
+   GEMINI_API_KEY=your_gemini_api_key_here
    ```
+   > [!TIP]
+   > Dapatkan API Key Gemini secara gratis di [Google AI Studio](https://aistudio.google.com/).
 
 ## 🏃 Cara Menjalankan Bot
 
@@ -60,7 +63,12 @@ Perintah PM2 yang berguna:
 - `templates/`: Template pesan WhatsApp (H-7, H-3, dll).
 - `utils/`: Fungsi pembantu (deteksi kategori pesan, penanggalan, dll).
 
-## 📊 Fitur Utama
+- **AI Proof Verification**: Menggunakan Google Gemini AI untuk memvalidasi bukti transfer secara otomatis.
+  - Memverifikasi nama penerima (**Vodeco Digital Mediatama**).
+  - Memverifikasi nomor rekening tujuan (**BCA/Mandiri**).
+  - Mendeteksi status transaksi (Berhasil/Sukses).
+  - Mendukung foto struk fisik maupun foto layar HP lain.
+- **Smart Categorization**: Memisahkan bukti transfer yang valid ke folder `transfers/` dan yang tidak valid ke `transfers/invalid/`.
 - **Auto-Reminder**: Mengirim pengingat otomatis pada H-7, H-3, H-1, dan hari H.
 - **Client Matching**: Secara otomatis mengenali nama klien saat mereka membalas pesan.
 - **Persistensi LID**: Mapping Linked ID WhatsApp disimpan ke database agar nama klien tidak hilang saat restart.
