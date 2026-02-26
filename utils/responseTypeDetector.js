@@ -34,13 +34,14 @@ function detectResponseType(messageText) {
         return 'konfirmasi_bayar'
     }
 
-    // Kategori 4: Komplain / Masalah
+    // Kategori 4: Kendala / Masalah / Komplain
     const complaintKeywords = [
-        'mahal', 'komplain', 'keberatan', 'tidak setuju', 'ga setuju',
-        'masalah', 'error', 'rusak', 'tidak bisa', 'ga bisa', 'susah'
+        'kendala', 'masalah', 'keluhan', 'error', 'bantuan', 'tolong',
+        'perlu bantuan', 'ada masalah', 'rusak', 'tidak bisa', 'ga bisa',
+        'gangguan', 'bermasalah', 'mahal', 'keberatan', 'komplain'
     ]
     if (complaintKeywords.some(keyword => text.includes(keyword))) {
-        return 'komplain'
+        return 'kendala'
     }
 
     // Kategori 5: Minta Perpanjangan Waktu (resmi)

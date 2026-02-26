@@ -89,7 +89,6 @@ CV. Vodeco Digital Mediatama`
   }
 
   if (daysDiff < 0) {
-    const overdueDays = Math.abs(daysDiff)
     return `Halo ${clientName},
 
 Kami dari CV. Vodeco Digital Mediatama ingin menginformasikan bahwa hingga hari ini, pembayaran untuk layanan ${service} sebesar ${formattedAmount}, yang jatuh tempo pada ${dueDate}, masih belum kami terima.

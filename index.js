@@ -1,8 +1,12 @@
 const {
   default: makeWASocket,
-  useMultiFileAuthState
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  downloadMediaMessage
 } = require("@whiskeysockets/baileys")
 
+const fs = require("fs")
+const path = require("path")
 const pino = require("pino")
 const chalk = require("chalk")
 const qrcode = require("qrcode-terminal")
@@ -11,18 +15,21 @@ const db = require("./db")
 const { sendSafe } = require("./rateLimit")
 const { getReminderText } = require("./templates/reminderText")
 const { formatToIndonesianDate } = require("./utils/dateFormatter")
+const { detectResponseType } = require('./utils/responseTypeDetector')
+const { isTransferProof } = require('./utils/aiValidator')
 
 // ===== GLOBAL STATE =====
 let sock = null
 let isConnected = false
 let reminderInterval = null
-let isReminderRunning = false // lock supaya tidak jalan paralel
-const lidToPhoneMap = {} // mapping LID -> nomor telepon
+let isReminderRunning = false
+let isInitialized = false // Flag untuk satu kali init
+let waVersion = null
+const lidToPhoneMap = {}
 
-// ===== LOAD LID MAPPINGS FROM DATABASE =====
+// ===== LOAD LID MAPPINGS =====
 async function loadLidMappings() {
   try {
-    // Buat tabel kalau belum ada
     await db.query(`
       CREATE TABLE IF NOT EXISTS lid_mapping (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -39,13 +46,16 @@ async function loadLidMappings() {
     for (const row of rows) {
       lidToPhoneMap[row.lid] = row.nomor_telepon
     }
-    console.log(chalk.green(`📎 Loaded ${rows.length} LID mapping(s) from database`))
+
+    // Hanya log pertama kali
+    if (!isInitialized) {
+      console.log(chalk.green(`📎 Loaded ${rows.length} LID mapping(s) from database`))
+    }
   } catch (err) {
     console.error(chalk.red('❌ Failed to load LID mappings:'), err.message)
   }
 }
 
-// ===== SAVE LID MAPPING TO DATABASE =====
 async function saveLidMapping(lid, nomorTelepon) {
   try {
     await db.query(
@@ -59,266 +69,230 @@ async function saveLidMapping(lid, nomorTelepon) {
 }
 
 async function startBot() {
-  console.log(chalk.blue("🚀 Starting WhatsApp Bot"))
+  // 1. One-time Initialization
+  if (!isInitialized) {
+    console.log(chalk.blue("🚀 Starting WhatsApp Bot"))
+    await loadLidMappings()
+    const { version } = await fetchLatestBaileysVersion()
+    waVersion = version
+    console.log(chalk.cyan(`📡 WA Version: v${waVersion.join('.')}`))
+    isInitialized = true
+  }
 
-  // Load LID mappings dari database supaya persist antar restart
-  await loadLidMappings()
-
-  const { state, saveCreds } = await useMultiFileAuthState("./LenwySesi")
+  const { state, saveCreds } = await useMultiFileAuthState("./session-data")
 
   sock = makeWASocket({
+    version: waVersion,
     logger: pino({ level: "silent" }),
     auth: state,
-    browser: ["BillingBot", "Chrome", "1.0.0"]
+    syncFullHistory: false
   })
 
-  // simpan session
   sock.ev.on("creds.update", saveCreds)
 
-  // ===== CONNECTION / QR =====
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update
 
     if (qr) {
-      console.log(chalk.yellow("📱 Scan QR WhatsApp - QR Code akan tetap ditampilkan sampai berhasil di-scan"))
-      console.log(chalk.cyan("Tip: Perbesar terminal untuk melihat QR code dengan lebih jelas"))
+      console.log(chalk.yellow("📱 Scan QR WhatsApp..."))
       qrcode.generate(qr, { small: false })
     }
 
     if (connection === "open") {
-      console.log(chalk.green("✔ WhatsApp Connected"))
-      isConnected = true
-
-      // mulai reminder HANYA SEKALI
-      if (!reminderInterval) {
-        console.log(chalk.cyan("⏱ Starting reminder loop"))
-        startReminderLoop()
+      if (!isConnected) {
+        console.log(chalk.green("✔ WhatsApp Connected"))
+        isConnected = true
+        if (!reminderInterval) startReminderLoop()
       }
     }
 
     if (connection === "close") {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401
-      const reason = lastDisconnect?.error?.output?.statusCode || 'unknown'
-
-      console.log(chalk.red("❌ Disconnected (stop reminder)"))
-      console.log(chalk.yellow(`Reason: ${reason}`))
-      console.log(chalk.yellow(`Should reconnect: ${shouldReconnect}`))
+      const statusCode = lastDisconnect?.error?.output?.statusCode
+      const isLogout = [401, 405].includes(statusCode)
 
       isConnected = false
 
-      // hentikan reminder kalau koneksi putus
-      if (reminderInterval) {
-        clearInterval(reminderInterval)
-        reminderInterval = null
-      }
-
-      // Auto reconnect jika bukan error 401 (logout)
-      if (shouldReconnect) {
-        console.log(chalk.cyan("🔄 Reconnecting in 5 seconds..."))
+      if (!isLogout) {
+        // Silent reconnect tanpa log startup lagi
         setTimeout(() => startBot(), 5000)
       } else {
-        console.log(chalk.red("⚠️ Logged out. Please delete LenwySesi folder and restart."))
+        console.log(chalk.red(`❌ Connection Error (${statusCode}). Please delete "./session-data" and restart.`))
       }
     }
   })
 
-  // ===== HANDLE INCOMING MESSAGES (SAVE CLIENT RESPONSES) =====
+  // ===== INCOMING MESSAGES =====
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages[0]
-    if (!msg.message) return
-
-    // PENTING: Abaikan pesan dari bot sendiri!
-    if (msg.key.fromMe) return
-
-    const messageType = Object.keys(msg.message)[0]
-    if (messageType === 'protocolMessage' || messageType === 'senderKeyDistributionMessage') {
-      return
-    }
+    if (!msg.message || msg.key.fromMe) return
 
     const from = msg.key.remoteJid
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      ""
+    const imageMsg = msg.message.imageMessage
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.buttonsResponseMessage?.selectedButtonId || imageMsg?.caption || ""
 
-    // Ekstrak nomor telepon (handle @s.whatsapp.net DAN @lid)
+    // Always log incoming messages for visibility
+    console.log(chalk.gray(`📥 Incoming message from ${from}: "${text.length > 50 ? text.substring(0, 50) + '...' : text}" ${imageMsg ? '[IMAGE]' : ''}`))
+
     let senderId = from.replace("@s.whatsapp.net", "").replace("@lid", "")
     const isLidFormat = from.endsWith("@lid")
 
-    const logToFile = (msg) => {
-      const fs = require('fs');
-      const timestamp = new Date().toISOString();
-      fs.appendFileSync('debug.log', `[${timestamp}] ${msg}\n`);
-      console.log(msg);
-    }
+    try {
+      let resolvedPhone = senderId
+      let namaWebsite = "UNKNOWN"
 
-    logToFile(`\n📨 Incoming message from: ${senderId} (Raw: ${from}, LID: ${isLidFormat})`)
-    if (text) logToFile(`📝 Message text: ${text.substring(0, 100)}`)
-
-    // Simpan balasan klien ke database
-    if (text && isConnected) {
-      try {
-        // Auto-detect response type
-        const { detectResponseType } = require('./utils/responseTypeDetector')
-        const responseType = detectResponseType(text)
-
-        // Coba cari client di database
-        let matchedClient = null
-        let resolvedPhone = senderId
-
-        // STEP 1: Kalau ini format LID, cek mapping dulu (memory + database)
-        if (isLidFormat) {
-          if (lidToPhoneMap[senderId]) {
-            resolvedPhone = lidToPhoneMap[senderId]
-            logToFile(`📎 LID ${senderId} mapped to phone (memory): ${resolvedPhone}`)
-          } else {
-            // Fallback: cek di database
-            try {
-              const [lidRows] = await db.query(
-                'SELECT nomor_telepon FROM lid_mapping WHERE lid = ?',
-                [senderId]
-              )
-              if (lidRows.length > 0) {
-                resolvedPhone = lidRows[0].nomor_telepon
-                lidToPhoneMap[senderId] = resolvedPhone // simpan ke memory juga
-                logToFile(`📎 LID ${senderId} mapped to phone (database): ${resolvedPhone}`)
-              }
-            } catch (dbErr) {
-              logToFile(`⚠️ Failed to lookup LID in database: ${dbErr.message}`)
-            }
+      // Resolve Phone from LID
+      if (isLidFormat) {
+        if (lidToPhoneMap[senderId]) {
+          resolvedPhone = lidToPhoneMap[senderId]
+        } else {
+          const [lidRows] = await db.query('SELECT nomor_telepon FROM lid_mapping WHERE lid = ?', [senderId])
+          if (lidRows.length > 0) {
+            resolvedPhone = lidRows[0].nomor_telepon
+            lidToPhoneMap[senderId] = resolvedPhone
           }
         }
+      }
 
-        // STEP 2: Normalisasi nomor HP
-        let phoneNumber0 = resolvedPhone
-        if (resolvedPhone.startsWith('62')) {
-          phoneNumber0 = '0' + resolvedPhone.substring(2)
+      // Find Client Name
+      const [clients] = await db.query(
+        "SELECT nama_website FROM pelunasan WHERE nomor_telepon IN (?, ?, ?)",
+        [resolvedPhone, resolvedPhone.startsWith('62') ? '0' + resolvedPhone.substring(2) : resolvedPhone, resolvedPhone.startsWith('0') ? '62' + resolvedPhone.substring(1) : resolvedPhone]
+      )
+
+      if (clients.length > 0) namaWebsite = clients[0].nama_website
+      else if (namaWebsite === "UNKNOWN") namaWebsite = `UNKNOWN_${senderId}`
+
+      // IF IMAGE RECEIVED (POTENTIAL TRANSFER PROOF)
+      if (imageMsg) {
+        console.log(chalk.bgMagenta.white.bold(` 📸 Media Received `))
+        console.log(chalk.magenta(`    ├─ From     : ${resolvedPhone}`))
+        console.log(chalk.magenta(`    ├─ Web      : ${namaWebsite}`))
+        console.log(chalk.magenta(`    └─ Downloading for AI check...`))
+
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: sock.updateMediaMessage
+          })
+
+          // AI VALIDATION
+          const mimeType = imageMsg.mimetype || 'image/jpeg'
+          const isValid = await isTransferProof(buffer, mimeType)
+
+          if (isValid) {
+            // Ensure the 'transfers' directory exists
+            const transfersDir = path.join(__dirname, 'transfers');
+            if (!fs.existsSync(transfersDir)) {
+              fs.mkdirSync(transfersDir);
+            }
+
+            const fileName = `proof_${resolvedPhone}_${Date.now()}.jpg`
+            const filePath = path.join(transfersDir, fileName)
+            fs.writeFileSync(filePath, buffer)
+
+            // Save to transfer proofs table
+            await db.query(
+              `INSERT INTO client_transfer_proofs (nomor_telepon, nama_website, file_path, caption) VALUES (?, ?, ?, ?)`,
+              [resolvedPhone, namaWebsite, filePath, text]
+            )
+
+            console.log(chalk.green(`    ✅ AI Verified: Valid Transfer Proof. Saved to transfers/`))
+          } else {
+            console.log(chalk.yellow(`    🗑️ AI Rejected: Invalid Proof. Storing for review...`))
+
+            // Ensure the 'transfers/invalid' directory exists
+            const invalidDir = path.join(__dirname, 'transfers', 'invalid');
+            if (!fs.existsSync(invalidDir)) {
+              fs.mkdirSync(invalidDir, { recursive: true });
+            }
+
+            const fileName = `invalid_${resolvedPhone}_${Date.now()}.jpg`
+            const filePath = path.join(invalidDir, fileName)
+            fs.writeFileSync(filePath, buffer)
+
+            // Save to invalid transfer proofs table
+            await db.query(
+              `INSERT INTO invalid_transfer_proofs (nomor_telepon, nama_website, file_path, caption) VALUES (?, ?, ?, ?)`,
+              [resolvedPhone, namaWebsite, filePath, text]
+            )
+            console.log(chalk.red(`    📁 Saved to transfers/invalid/${fileName}`))
+          }
+        } catch (downloadErr) {
+          console.error(chalk.red(`    ❌ Failed to process media: ${downloadErr.message}`))
         }
-        let phoneNumber62 = resolvedPhone
-        if (resolvedPhone.startsWith('0')) {
-          phoneNumber62 = '62' + resolvedPhone.substring(1)
-        }
+      }
 
-        // STEP 3: Cari di database pelunasan
-        const [clients] = await db.query(
-          "SELECT nama_website, nomor_telepon FROM pelunasan WHERE nomor_telepon IN (?, ?, ?)",
-          [resolvedPhone, phoneNumber0, phoneNumber62]
-        )
+      // IF TEXT RECEIVED (NORMAL RESPONSE)
+      if (text && !imageMsg) {
+        const responseType = detectResponseType(text)
 
-        if (clients.length > 0) {
-          matchedClient = clients[0]
-          logToFile(`✅ Client found: ${matchedClient.nama_website}`)
-        } else {
-          logToFile(`⚠️ No client match for ${resolvedPhone} (LID: ${isLidFormat})`)
-        }
+        // HIGH VISIBILITY LOG
+        console.log(chalk.bgMagenta.white.bold(` 📩 New Reply `))
+        console.log(chalk.magenta(`    ├─ Client   : ${resolvedPhone}`))
+        console.log(chalk.magenta(`    ├─ Website  : ${namaWebsite}`))
+        console.log(chalk.magenta(`    ├─ Category : [${responseType}]`))
+        console.log(chalk.magenta(`    └─ Message  : "${text}"`))
+        console.log("")
 
-        // STEP 4: SIMPAN SEMUA pesan (matched atau tidak)
-        const namaWebsite = matchedClient ? matchedClient.nama_website : `UNKNOWN_${senderId}`
-        const [saveResult] = await db.query(
-          `INSERT INTO client_responses 
-          (nama_website, nomor_telepon, message_text, response_type, received_at) 
-          VALUES (?, ?, ?, ?, NOW())`,
+        // Save to database
+        await db.query(
+          `INSERT INTO client_responses (nama_website, nomor_telepon, message_text, response_type, received_at) 
+           VALUES (?, ?, ?, ?, NOW())`,
           [namaWebsite, resolvedPhone, text, responseType]
         )
-
-        logToFile(`💬 Response saved [${responseType}] from ${namaWebsite}. ID: ${saveResult.insertId}`)
-
-      } catch (err) {
-        logToFile(`❌ Error saving client response: ${err.message}`)
-        console.error(err.stack)
       }
+
+    } catch (err) {
+      console.error(chalk.red("❌ Error processing message:"), err.message)
     }
 
-    // Manual test (PING)
-    if (text.toLowerCase() === "ping" && isConnected) {
-      await sendSafe(sock, from, { text: "pong 🏓 bot aktif" })
-    }
+    if (text.toLowerCase() === "ping") await sendSafe(sock, from, { text: "pong 🏓" })
   })
 }
 
-// ===== REMINDER LOOP (AMAN) =====
 async function checkAndSendReminders() {
-  if (!isConnected) return
-  if (isReminderRunning) {
-    console.log(chalk.gray("⏳ Previous reminder cycle still running, skipping..."))
-    return
-  }
-
+  if (!isConnected || isReminderRunning) return
   isReminderRunning = true
   try {
     console.log(chalk.cyan("🔍 Checking for pending reminders..."))
-
     const [rows] = await db.query(`
-      SELECT *,
-      DATEDIFF(due_date, CURDATE()) AS diff
-      FROM pelunasan
-      WHERE status = 'menunggu_pembayaran'
-        AND due_date IS NOT NULL
+      SELECT *, DATEDIFF(due_date, CURDATE()) AS diff FROM pelunasan
+      WHERE status = 'menunggu_pembayaran' AND due_date IS NOT NULL
         AND (last_reminder_sent IS NULL OR DATE(last_reminder_sent) < CURDATE())
-        AND (DATEDIFF(due_date, CURDATE()) IN (7, 3, 1, 0) OR DATEDIFF(due_date, CURDATE()) < 0)
+        AND DATEDIFF(due_date, CURDATE()) IN (7, 3, 1, 0, -3)
     `)
+
     if (!rows.length) {
-      console.log(chalk.gray("📭 No pending reminders right now."))
+      console.log(chalk.gray("📭 No pending reminders."))
       return
     }
 
-    console.log(chalk.yellow(`📋 Found ${rows.length} client(s) to remind`))
-
     for (const row of rows) {
-      if (!isConnected) break
+      const text = getReminderText(row.nama_website, formatToIndonesianDate(row.due_date), row.paket, row.harga_renewal, row.diff)
+      const sendResult = await sendSafe(sock, `${row.nomor_telepon}@s.whatsapp.net`, { text })
 
-      // format tanggal ke format Indonesia
-      const formattedDate = formatToIndonesianDate(row.due_date)
-
-      // gunakan template dari reminderText.js
-      const text = getReminderText(row.nama_website, formattedDate, row.paket, row.harga_renewal, row.diff)
-
-      if (!text) continue
-
-      const jid = `${row.nomor_telepon}@s.whatsapp.net`
-
-      // kirim HANYA saat koneksi siap
-      const sendResult = await sendSafe(sock, jid, { text })
-
-      // Simpan LID mapping jika ada (untuk tracking balasan)
-      if (sendResult && sendResult.key && sendResult.key.remoteJid) {
-        const replyJid = sendResult.key.remoteJid
-        if (replyJid.endsWith('@lid')) {
-          const lid = replyJid.replace('@lid', '')
-          lidToPhoneMap[lid] = row.nomor_telepon
-          await saveLidMapping(lid, row.nomor_telepon) // persist ke database!
-          console.log(chalk.cyan(`📎 LID mapped & saved: ${lid} -> ${row.nomor_telepon}`))
-        }
+      if (sendResult?.key?.remoteJid?.endsWith('@lid')) {
+        const lid = sendResult.key.remoteJid.replace('@lid', '')
+        lidToPhoneMap[lid] = row.nomor_telepon
+        await saveLidMapping(lid, row.nomor_telepon)
       }
 
-      // Update tracking fields
       await db.query(
-        `UPDATE pelunasan 
-        SET last_reminder_sent = NOW(), 
-            reminder_count = reminder_count + 1,
-            last_reminder_type = ?,
-            updated_at = NOW()
-        WHERE nama_website = ?`,
+        `UPDATE pelunasan SET last_reminder_sent = NOW(), reminder_count = reminder_count + 1, last_reminder_type = ?, updated_at = NOW() WHERE nama_website = ?`,
         [`H${row.diff >= 0 ? '+' : ''}${row.diff}`, row.nama_website]
       )
-
-      console.log(chalk.green(`📤 Reminder sent to ${row.nama_website} (H${row.diff >= 0 ? '+' : ''}${row.diff})`))
+      console.log(chalk.green(`📤 Reminder sent to ${row.nama_website} (H${row.diff})`))
     }
   } catch (err) {
-    console.error("❌ Reminder error:", err.message)
+    // console.error("❌ Reminder error:", err.message)
   } finally {
     isReminderRunning = false
   }
 }
 
 function startReminderLoop() {
-  // Langsung cek pertama kali (jangan tunggu 60 detik)
   checkAndSendReminders()
-
-  // Lalu cek setiap 60 detik
   reminderInterval = setInterval(checkAndSendReminders, 60_000)
 }
 
-
-// ===== START =====
 startBot()
