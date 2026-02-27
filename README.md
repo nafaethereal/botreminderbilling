@@ -57,19 +57,27 @@ Perintah PM2 yang berguna:
 - `pm2 status` - Melihat status bot.
 - `pm2 restart botreminder` - Restart bot.
 
-## 📁 Struktur Penting
-- `index.js`: File utama logika bot.
-- `database/`: Berisi skema SQL dan migrasi.
-- `templates/`: Template pesan WhatsApp (H-7, H-3, dll).
-- `utils/`: Fungsi pembantu (deteksi kategori pesan, penanggalan, dll).
-
 - **AI Proof Verification**: Menggunakan Google Gemini AI untuk memvalidasi bukti transfer secara otomatis.
   - Memverifikasi nama penerima (**Vodeco Digital Mediatama**).
   - Memverifikasi nomor rekening tujuan (**BCA/Mandiri**).
-  - Mendeteksi status transaksi (Berhasil/Sukses).
-  - Mendukung foto struk fisik maupun foto layar HP lain.
-- **Smart Categorization**: Memisahkan bukti transfer yang valid ke folder `transfers/` dan yang tidak valid ke `transfers/invalid/`.
+  - Mendeteksi status transaksi (Berhasil/Sukses/Selesai).
+  - Mengekstrak nominal transfer secara otomatis.
+- **Strict Anti-Noise Filter**: 
+  - **Membatasi Interaksi**: Bot hanya merespon nomor yang ada di database tagihan ATAU yang sudah pernah dikirimi reminder. Chat pribadi/kontak baru akan diabaikan sepenuhnya.
+  - **Filter Status & Grup**: Mengabaikan Status WA (Stories) dan pesan Grup secara otomatis.
+  - **Terminal Silence**: Log terminal hanya menampilkan aktivitas dari klien yang valid, menjaga privasi chat pribadi Anda.
+- **Systematic Storage (3-Way Check)**:
+  - `transfers/valid/` ✅: Bukti transfer yang benar dilaporkan ke admin.
+  - `transfers/invalid/` ❌: Struk transaksi yang salah data/rekening.
+  - `transfers/unrelated/` 🗑️: Foto non-transaksi (game, meme, dll) dipisahkan agar tidak mengganggu admin.
 - **Auto-Reminder**: Mengirim pengingat otomatis pada H-7, H-3, H-1, dan hari H.
-- **Client Matching**: Secara otomatis mengenali nama klien saat mereka membalas pesan.
-- **Persistensi LID**: Mapping Linked ID WhatsApp disimpan ke database agar nama klien tidak hilang saat restart.
-- **Response Categorization**: Mengelompokkan balasan klien (janji bayar, sudah bayar, pertanyaan, dll).
+- **Client Matching & Persistence**: Mengenali nama klien secara otomatis (LID format) dan menyimpan mapping-nya ke database.
+- **Enhanced Response Detection**: Kategori balasan lebih akurat (janji bayar, konfirmasi, pertanyaan, kendala) dengan dukungan bahasa santai/singkatan.
+
+## 📁 Struktur Penting
+- `index.js`: File utama logika bot & filtering.
+- `database/`: Skema SQL (`schema.sql`) untuk tabel utama.
+- `utils/aiValidator.js`: Modul integrasi Gemini AI & Retry Mechanism.
+- `utils/responseTypeDetector.js`: Logika deteksi kategori pesan klien.
+- `transfers/`: Direktori penyimpanan bukti transfer (valid, invalid, unrelated).
+- `scripts/`: Berisi skrip pembantu untuk manajemen database.
