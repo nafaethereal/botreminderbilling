@@ -26,6 +26,7 @@ let isReminderRunning = false
 let isInitialized = false // Flag untuk satu kali init
 let waVersion = null
 const lidToPhoneMap = {}
+const adminNumber = '6285842903319@s.whatsapp.net'
 
 // ===== LOAD LID MAPPINGS =====
 async function loadLidMappings() {
@@ -38,6 +39,19 @@ async function loadLidMappings() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_lid (lid),
+        INDEX idx_nomor_telepon (nomor_telepon)
+      )
+    `)
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS unrelated_images (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        nomor_telepon VARCHAR(20) NOT NULL,
+        nama_website VARCHAR(255) NOT NULL,
+        file_path VARCHAR(255) NOT NULL,
+        caption TEXT,
+        reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_nomor_telepon (nomor_telepon)
       )
     `)
@@ -127,40 +141,66 @@ async function startBot() {
     if (!msg.message || msg.key.fromMe) return
 
     const from = msg.key.remoteJid
+
+    // FILTER: Ignore Status WA and Group Messages
+    if (from === 'status@broadcast' || from.endsWith('@g.us')) {
+      // console.log(chalk.gray(`🔇 Ignoring noise from ${from}`))
+      return
+    }
     const imageMsg = msg.message.imageMessage
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.buttonsResponseMessage?.selectedButtonId || imageMsg?.caption || ""
-
-    // Always log incoming messages for visibility
-    console.log(chalk.gray(`📥 Incoming message from ${from}: "${text.length > 50 ? text.substring(0, 50) + '...' : text}" ${imageMsg ? '[IMAGE]' : ''}`))
 
     let senderId = from.replace("@s.whatsapp.net", "").replace("@lid", "")
     const isLidFormat = from.endsWith("@lid")
 
     try {
       let resolvedPhone = senderId
-      let namaWebsite = "UNKNOWN"
+      let namaWebsite = ""
+      let hasHistory = false
 
-      // Resolve Phone from LID
+      // 1. Resolve Phone & Check History from LID
       if (isLidFormat) {
         if (lidToPhoneMap[senderId]) {
           resolvedPhone = lidToPhoneMap[senderId]
+          hasHistory = true
         } else {
           const [lidRows] = await db.query('SELECT nomor_telepon FROM lid_mapping WHERE lid = ?', [senderId])
           if (lidRows.length > 0) {
             resolvedPhone = lidRows[0].nomor_telepon
             lidToPhoneMap[senderId] = resolvedPhone
+            hasHistory = true
           }
         }
+      } else {
+        // Also check history for non-LID senders (in case they are in the mapping table)
+        const [lidRows] = await db.query('SELECT nomor_telepon FROM lid_mapping WHERE nomor_telepon = ?', [senderId])
+        if (lidRows.length > 0) hasHistory = true
       }
 
-      // Find Client Name
+      // 2. Find Client Name and Package Info from pelunasan
       const [clients] = await db.query(
-        "SELECT nama_website FROM pelunasan WHERE nomor_telepon IN (?, ?, ?)",
+        "SELECT nama_website, paket, harga_renewal FROM pelunasan WHERE nomor_telepon IN (?, ?, ?)",
         [resolvedPhone, resolvedPhone.startsWith('62') ? '0' + resolvedPhone.substring(2) : resolvedPhone, resolvedPhone.startsWith('0') ? '62' + resolvedPhone.substring(1) : resolvedPhone]
       )
 
-      if (clients.length > 0) namaWebsite = clients[0].nama_website
-      else if (namaWebsite === "UNKNOWN") namaWebsite = `UNKNOWN_${senderId}`
+      // 3. APPLY FILTER: Only process if active client OR has historical reminder record
+      if (clients.length === 0 && !hasHistory) {
+        // console.log(chalk.gray(`🔇 Ignoring message from unknown/untracked contact: ${from}`))
+        return
+      }
+
+      // Log only after validation
+      console.log(chalk.gray(`📥 Incoming message from ${from}: "${text.length > 50 ? text.substring(0, 50) + '...' : text}" ${imageMsg ? '[IMAGE]' : ''}`))
+
+      let clientPackage = "N/A"
+      let renewalPrice = 0
+      if (clients.length > 0) {
+        namaWebsite = clients[0].nama_website
+        clientPackage = clients[0].paket || "N/A"
+        renewalPrice = clients[0].harga_renewal || 0
+      } else {
+        namaWebsite = `ALUMNI_${resolvedPhone}` // Past client not in current pelunasan
+      }
 
       // IF IMAGE RECEIVED (POTENTIAL TRANSFER PROOF)
       if (imageMsg) {
@@ -177,17 +217,68 @@ async function startBot() {
 
           // AI VALIDATION
           const mimeType = imageMsg.mimetype || 'image/jpeg'
-          const isValid = await isTransferProof(buffer, mimeType)
+          const { isValid, isUnrelated, reason, amount: aiAmount } = await isTransferProof(buffer, mimeType)
+
+          // CASE 1: Completely Unrelated Image (Not a transaction document)
+          if (isUnrelated) {
+            console.log(chalk.yellow(`    ⏭️ AI Filter: Unrelated image detected. Saving to trash...`))
+
+            const unrelatedDir = path.join(__dirname, 'transfers', 'unrelated');
+            if (!fs.existsSync(unrelatedDir)) {
+              fs.mkdirSync(unrelatedDir, { recursive: true });
+            }
+
+            const fileName = `unrelated_${resolvedPhone}_${Date.now()}.jpg`
+            const filePath = path.join(unrelatedDir, fileName)
+            fs.writeFileSync(filePath, buffer)
+
+            // Save to unrelated_images table
+            await db.query(
+              `INSERT INTO unrelated_images (nomor_telepon, nama_website, file_path, caption, reason) VALUES (?, ?, ?, ?, ?)`,
+              [resolvedPhone, namaWebsite, filePath, text, reason]
+            )
+            return // Stop here, do not notify admin
+          }
+
+          // ADMIN NOTIFICATION MESSAGE
+          const billedAmount = Math.floor(renewalPrice)
+          const transferredAmount = aiAmount || 0
+          const formattedBilled = billedAmount.toLocaleString('id-ID')
+          const formattedTransferred = transferredAmount.toLocaleString('id-ID')
+
+          let paymentStatusText = ""
+          if (transferredAmount >= billedAmount) {
+            paymentStatusText = "✅ *Status Pembayaran:* LUNAS"
+          } else {
+            const diff = billedAmount - transferredAmount
+            paymentStatusText = `⚠️ *Sisa Kurang:* Rp ${diff.toLocaleString('id-ID')}`
+          }
+
+          const headerText = isValid ? 'NOTIFIKASI TRANSFER BARU (TRANSFER VALID)' : 'NOTIFIKASI TRANSFER BARU (TRANSFER TIDAK VALID)'
+
+          const adminNotifyText = `📢 *${headerText}*
+
+👤 *Client:* ${namaWebsite}
+📱 *No WA:* ${resolvedPhone}
+📦 *Paket:* ${clientPackage}
+💰 *Jumlah Tagihan:* Rp ${formattedBilled}
+💵 *Jumlah Transfer:* Rp ${aiAmount ? formattedTransferred : 'Tidak terdeteksi'}
+
+${paymentStatusText}
+
+📝 *Caption:* ${text || '-'}
+📑 *Status Transfer:* ${isValid ? 'Bukti Transfer Valid ✅' : 'Bukti Transfer Tidak Valid ❌'}
+💬 *Alasan:* ${reason}`
 
           if (isValid) {
-            // Ensure the 'transfers' directory exists
-            const transfersDir = path.join(__dirname, 'transfers');
-            if (!fs.existsSync(transfersDir)) {
-              fs.mkdirSync(transfersDir);
+            // Ensure the 'transfers/valid' directory exists
+            const validDir = path.join(__dirname, 'transfers', 'valid');
+            if (!fs.existsSync(validDir)) {
+              fs.mkdirSync(validDir, { recursive: true });
             }
 
             const fileName = `proof_${resolvedPhone}_${Date.now()}.jpg`
-            const filePath = path.join(transfersDir, fileName)
+            const filePath = path.join(validDir, fileName)
             fs.writeFileSync(filePath, buffer)
 
             // Save to transfer proofs table
@@ -196,7 +287,7 @@ async function startBot() {
               [resolvedPhone, namaWebsite, filePath, text]
             )
 
-            console.log(chalk.green(`    ✅ AI Verified: Valid Transfer Proof. Saved to transfers/`))
+            console.log(chalk.green(`    ✅ AI Verified: Valid Transfer Proof. Saved to transfers/valid/`))
           } else {
             console.log(chalk.yellow(`    🗑️ AI Rejected: Invalid Proof. Storing for review...`))
 
@@ -217,6 +308,13 @@ async function startBot() {
             )
             console.log(chalk.red(`    📁 Saved to transfers/invalid/${fileName}`))
           }
+
+          // Send to Admin
+          await sock.sendMessage(adminNumber, {
+            image: buffer,
+            caption: adminNotifyText
+          })
+          console.log(chalk.blue(`    📲 Admin notified via WhatsApp (${adminNumber})`))
         } catch (downloadErr) {
           console.error(chalk.red(`    ❌ Failed to process media: ${downloadErr.message}`))
         }
