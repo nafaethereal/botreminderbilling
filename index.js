@@ -17,6 +17,7 @@ const { getReminderText } = require("./templates/reminderText")
 const { formatToIndonesianDate } = require("./utils/dateFormatter")
 const { detectResponseType } = require('./utils/responseTypeDetector')
 const { isTransferProof } = require('./utils/aiValidator')
+const { parseAdminResponse } = require('./utils/adminResponseParser')
 
 // ===== GLOBAL STATE =====
 let sock = null
@@ -26,7 +27,7 @@ let isReminderRunning = false
 let isInitialized = false // Flag untuk satu kali init
 let waVersion = null
 const lidToPhoneMap = {}
-const adminNumber = '6285842903319@s.whatsapp.net'
+const adminNumber = '6287862070932@s.whatsapp.net'
 
 // ===== LOAD LID MAPPINGS =====
 async function loadLidMappings() {
@@ -117,17 +118,26 @@ async function startBot() {
         console.log(chalk.green("✔ WhatsApp Connected"))
         isConnected = true
         if (!reminderInterval) startReminderLoop()
+      } else {
+        // Re-open without being previously closed (Baileys quirk)
+        console.log(chalk.blue("ℹ WhatsApp Connection Re-synced"))
       }
     }
 
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode
+      const reason = lastDisconnect?.error?.message || "Unknown reason"
       const isLogout = [401, 405].includes(statusCode)
+
+      if (isConnected) {
+        console.log(chalk.yellow(`📡 Connection Closed: ${reason} (Status: ${statusCode})`))
+      }
 
       isConnected = false
 
       if (!isLogout) {
         // Silent reconnect tanpa log startup lagi
+        console.log(chalk.gray("🔄 Reconnecting in 5s..."))
         setTimeout(() => startBot(), 5000)
       } else {
         console.log(chalk.red(`❌ Connection Error (${statusCode}). Please delete "./session-data" and restart.`))
@@ -144,9 +154,126 @@ async function startBot() {
 
     // FILTER: Ignore Status WA and Group Messages
     if (from === 'status@broadcast' || from.endsWith('@g.us')) {
-      // console.log(chalk.gray(`🔇 Ignoring noise from ${from}`))
       return
     }
+
+    // ===== HANDLER: Admin Reply for Payment Confirmation =====
+    // Resolve sender's phone number to handle both @s.whatsapp.net and @lid formats
+    const adminPhone = adminNumber.replace('@s.whatsapp.net', '')
+    const senderPhone = from.includes('@lid') ? (lidToPhoneMap[from.replace('@lid', '')] || null) : from.replace('@s.whatsapp.net', '')
+    const isAdmin = senderPhone === adminPhone
+
+    if (isAdmin) {
+      const adminText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
+      console.log(`👮 Admin message detected from ${from}: "${adminText}"`)
+      if (!adminText) return // Admin sent something non-text (e.g. sticker), ignore
+
+      // Check if there's a pending confirmation awaiting an amount (edge case)
+      const [awaitingRows] = await db.query(
+        'SELECT * FROM pending_confirmations WHERE awaiting_amount = 1 ORDER BY created_at DESC LIMIT 1'
+      )
+
+      if (awaitingRows.length > 0) {
+        const pending = awaitingRows[0]
+        const parsed = parseAdminResponse(adminText)
+
+        if (parsed.type === 'amount') {
+          const nominal = parsed.amount
+          const harga = parseFloat(pending.harga_renewal)
+
+          // Fetch current payment status to accumulate
+          const [currentStatus] = await db.query('SELECT paid_amount FROM pelunasan WHERE nama_website = ?', [pending.nama_website])
+          const existingPaid = currentStatus.length > 0 ? parseFloat(currentStatus[0].paid_amount) : 0
+          const totalPaid = existingPaid + nominal
+          const remaining = harga - totalPaid
+
+          const formattedNominal = nominal.toLocaleString('id-ID')
+          const formattedTotal = totalPaid.toLocaleString('id-ID')
+          const formattedHarga = harga.toLocaleString('id-ID')
+
+          if (totalPaid >= harga) {
+            await db.query(
+              `UPDATE pelunasan SET status = 'sudah_bayar', paid_amount = ?, remaining_amount = 0, is_complete = 1, updated_at = NOW() WHERE nama_website = ?`,
+              [totalPaid, pending.nama_website]
+            )
+            await sendSafe(sock, from, { text: `✅ *Status Diperbarui: LUNAS*\n\n🏢 Client: ${pending.nama_website}\n💵 Transfer Baru: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n✔ Pembayaran penuh terkonfirmasi.` })
+          } else {
+            const sisa = remaining
+            await db.query(
+              `UPDATE pelunasan SET status = 'kurang_bayar', paid_amount = ?, remaining_amount = ?, is_complete = 0, updated_at = NOW() WHERE nama_website = ?`,
+              [totalPaid, sisa, pending.nama_website]
+            )
+            await sendSafe(sock, from, { text: `⚠️ *Status Diperbarui: KURANG BAYAR*\n\n🏢 Client: ${pending.nama_website}\n💵 Transfer Baru: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n📉 Tagihan: Rp ${formattedHarga}\n🔴 Sisa: Rp ${sisa.toLocaleString('id-ID')}` })
+          }
+
+          await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
+          console.log(chalk.green(`✅ Admin provided amount ${nominal} for ${pending.nama_website}`))
+          return
+        }
+      }
+
+      // Check normal pending confirmation (awaiting 'Sudah'/'Belum')
+      const [pendingRows] = await db.query(
+        'SELECT * FROM pending_confirmations WHERE awaiting_amount = 0 ORDER BY created_at DESC LIMIT 1'
+      )
+
+      if (pendingRows.length > 0) {
+        const pending = pendingRows[0]
+        const parsed = parseAdminResponse(adminText)
+
+        if (parsed.type === 'sudah') {
+          const nominal = parseFloat(pending.jumlah_transfer)
+          const harga = parseFloat(pending.harga_renewal)
+
+          // Edge case: AI did not detect amount
+          if (nominal === 0) {
+            await db.query('UPDATE pending_confirmations SET awaiting_amount = 1 WHERE id = ?', [pending.id])
+            await sendSafe(sock, from, { text: `🔢 Nominal tidak terdeteksi dari bukti transfer *${pending.nama_website}*.\n\nBerapa jumlah yang sudah masuk? (ketik angka, contoh: 500000)` })
+            console.log(chalk.yellow(`⚠️ AI amount=0 for ${pending.nama_website}, asking admin for amount`))
+            return
+          }
+
+          // Fetch current payment status to accumulate
+          const [currentStatus] = await db.query('SELECT paid_amount FROM pelunasan WHERE nama_website = ?', [pending.nama_website])
+          const existingPaid = currentStatus.length > 0 ? parseFloat(currentStatus[0].paid_amount) : 0
+          const totalPaid = existingPaid + nominal
+          const remaining = harga - totalPaid
+
+          const formattedNominal = nominal.toLocaleString('id-ID')
+          const formattedTotal = totalPaid.toLocaleString('id-ID')
+          const formattedHarga = harga.toLocaleString('id-ID')
+
+          if (totalPaid >= harga) {
+            await db.query(
+              `UPDATE pelunasan SET status = 'sudah_bayar', paid_amount = ?, remaining_amount = 0, is_complete = 1, updated_at = NOW() WHERE nama_website = ?`,
+              [totalPaid, pending.nama_website]
+            )
+            await sendSafe(sock, from, { text: `✅ *Status Diperbarui: LUNAS*\n\n🏢 Client: ${pending.nama_website}\n💵 Transfer: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n✔ Pembayaran penuh terkonfirmasi.` })
+          } else {
+            const sisa = remaining
+            await db.query(
+              `UPDATE pelunasan SET status = 'kurang_bayar', paid_amount = ?, remaining_amount = ?, is_complete = 0, updated_at = NOW() WHERE nama_website = ?`,
+              [totalPaid, sisa, pending.nama_website]
+            )
+            await sendSafe(sock, from, { text: `⚠️ *Status Diperbarui: KURANG BAYAR*\n\n🏢 Client: ${pending.nama_website}\n💵 Transfer: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n📉 Tagihan: Rp ${formattedHarga}\n🔴 Sisa: Rp ${sisa.toLocaleString('id-ID')}` })
+          }
+
+          await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
+          console.log(chalk.green(`✅ Admin confirmed payment for ${pending.nama_website}`))
+          return
+
+        } else if (parsed.type === 'belum') {
+          await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
+          await sendSafe(sock, from, { text: `📋 Dicatat. Status *${pending.nama_website}* tetap menunggu pembayaran.` })
+          console.log(chalk.yellow(`⚠️ Admin confirmed NOT received for ${pending.nama_website}`))
+          return
+        }
+        // If type is 'unknown', fall through (admin sent something else)
+      }
+      return // Admin message but no active pending confirmation or unrecognized, ignore
+    }
+    // ===== END ADMIN HANDLER =====
+
     const imageMsg = msg.message.imageMessage
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.buttonsResponseMessage?.selectedButtonId || imageMsg?.caption || ""
 
@@ -309,12 +436,27 @@ ${paymentStatusText}
             console.log(chalk.red(`    📁 Saved to transfers/invalid/${fileName}`))
           }
 
-          // Send to Admin
+          // Send to Admin with confirmation prompt
+          const confirmationPrompt = `
+💬 *Konfirmasi Pembayaran*
+Sudah masuk ke rekening?
+
+✏️ Balas: *Sudah* atau *Belum*
+_(Bot akan otomatis menentukan lunas/kurang berdasarkan nominal bukti transfer)_`
+
           await sock.sendMessage(adminNumber, {
             image: buffer,
-            caption: adminNotifyText
+            caption: adminNotifyText + confirmationPrompt
           })
-          console.log(chalk.blue(`    📲 Admin notified via WhatsApp (${adminNumber})`))
+
+          // Save to pending_confirmations for admin reply tracking
+          await db.query(
+            `INSERT INTO pending_confirmations (nomor_telepon_client, nama_website, jumlah_transfer, harga_renewal, is_valid, expires_at)
+             VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
+            [resolvedPhone, namaWebsite, aiAmount || 0, billedAmount, isValid ? 1 : 0]
+          )
+
+          console.log(chalk.blue(`    📲 Admin notified via WhatsApp (${adminNumber}). Awaiting confirmation.`))
         } catch (downloadErr) {
           console.error(chalk.red(`    ❌ Failed to process media: ${downloadErr.message}`))
         }
