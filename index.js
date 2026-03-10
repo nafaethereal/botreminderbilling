@@ -1,3 +1,5 @@
+require("dotenv").config()
+
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -27,7 +29,8 @@ let isReminderRunning = false
 let isInitialized = false // Flag untuk satu kali init
 let waVersion = null
 const lidToPhoneMap = {}
-const adminNumber = '6287862070932@s.whatsapp.net'
+const sentMessageMap = {} // Track sent reminder: { messageId: phoneNumber }
+const adminNumber = `${process.env.ADMIN_NUMBER}@s.whatsapp.net`
 
 // ===== LOAD LID MAPPINGS =====
 async function loadLidMappings() {
@@ -145,15 +148,93 @@ async function startBot() {
     }
   })
 
+  // ===== CAPTURE LID FROM CONTACTS EVENTS =====
+  sock.ev.on('contacts.update', (contacts) => {
+    for (const contact of contacts) {
+      if (contact.id?.endsWith('@lid') && contact.name) {
+        console.log(chalk.cyan(`📎 contacts.update: LID=${contact.id}, name=${contact.name}`))
+      }
+    }
+  })
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const contact of contacts) {
+      if (contact.id?.endsWith('@lid')) {
+        console.log(chalk.cyan(`📎 contacts.upsert: LID=${contact.id}, name=${contact.notify || contact.name || 'unknown'}`))
+      }
+    }
+  })
+
+  // ===== CAPTURE LID FROM MESSAGE STATUS UPDATES (delivered/read) =====
+  sock.ev.on('messages.update', (updates) => {
+    for (const update of updates) {
+      const remoteJid = update.key?.remoteJid
+      const msgId = update.key?.id
+      if (remoteJid?.endsWith('@lid') && msgId && sentMessageMap[msgId]) {
+        const lid = remoteJid.replace('@lid', '')
+        if (!lidToPhoneMap[lid]) {
+          const phone = sentMessageMap[msgId]
+          lidToPhoneMap[lid] = phone
+          saveLidMapping(lid, phone)
+          console.log(chalk.green(`📎 messages.update: Mapped LID ${lid} → ${phone}`))
+          delete sentMessageMap[msgId]
+        }
+      }
+    }
+  })
+
+  sock.ev.on('message-receipt.update', (updates) => {
+    for (const update of updates) {
+      const remoteJid = update.key?.remoteJid
+      const msgId = update.key?.id
+      if (remoteJid?.endsWith('@lid') && msgId && sentMessageMap[msgId]) {
+        const lid = remoteJid.replace('@lid', '')
+        if (!lidToPhoneMap[lid]) {
+          const phone = sentMessageMap[msgId]
+          lidToPhoneMap[lid] = phone
+          saveLidMapping(lid, phone)
+          console.log(chalk.green(`📎 message-receipt: Mapped LID ${lid} → ${phone}`))
+          delete sentMessageMap[msgId]
+        }
+      }
+    }
+  })
+
   // ===== INCOMING MESSAGES =====
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages[0]
-    if (!msg.message || msg.key.fromMe) return
+    if (!msg.message) return
+
+    // Capture LID mapping from bot's own sent messages
+    if (msg.key.fromMe) {
+      const remoteJid = msg.key.remoteJid
+      if (remoteJid?.endsWith('@lid')) {
+        const lid = remoteJid.replace('@lid', '')
+        // Cek apakah message ID ini ada di sentMessageMap
+        const msgId = msg.key.id
+        if (sentMessageMap[msgId] && !lidToPhoneMap[lid]) {
+          const phone = sentMessageMap[msgId]
+          lidToPhoneMap[lid] = phone
+          saveLidMapping(lid, phone)
+          delete sentMessageMap[msgId]
+          console.log(chalk.green(`📎 fromMe: Mapped LID ${lid} → ${phone}`))
+        }
+      }
+      return
+    }
 
     const from = msg.key.remoteJid
 
-    // FILTER: Ignore Status WA and Group Messages
+    // FILTER: Ignore Status WA, Group Messages, and Bot's own number
     if (from === 'status@broadcast' || from.endsWith('@g.us')) {
+      // console.log(chalk.gray(`🔇 DEBUG: Ignored broadcast/group: ${from}`))
+      return
+    }
+
+    // Ignore messages from the bot's own number
+    const botNumber = sock.user?.id?.replace(/:\d+@/, '@') || ''
+    if (from === botNumber) {
+      // console.log(chalk.gray(`🔇 DEBUG: Ignored own number: ${from}`))
       return
     }
 
@@ -162,115 +243,159 @@ async function startBot() {
     const adminPhone = adminNumber.replace('@s.whatsapp.net', '')
     const senderPhone = from.includes('@lid') ? (lidToPhoneMap[from.replace('@lid', '')] || null) : from.replace('@s.whatsapp.net', '')
     const isAdmin = senderPhone === adminPhone
+    console.log(chalk.cyan(`🔍 DEBUG: from=${from}, senderPhone=${senderPhone}, adminPhone=${adminPhone}, isAdmin=${isAdmin}`))
 
     if (isAdmin) {
       const adminText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
       console.log(`👮 Admin message detected from ${from}: "${adminText}"`)
-      if (!adminText) return // Admin sent something non-text (e.g. sticker), ignore
+      if (!adminText && !msg.message?.imageMessage) return // Only ignore if truly empty and NOT an image
 
-      // Check if there's a pending confirmation awaiting an amount (edge case)
-      const [awaitingRows] = await db.query(
-        'SELECT * FROM pending_confirmations WHERE awaiting_amount = 1 ORDER BY created_at DESC LIMIT 1'
-      )
+      // Resolve the quoted message ID (if admin replied to a specific message)
+      const contextInfo = msg.message?.extendedTextMessage?.contextInfo || msg.message?.buttonsResponseMessage?.contextInfo || null
+      const quotedStanzaId = contextInfo?.stanzaId || null
 
-      if (awaitingRows.length > 0) {
-        const pending = awaitingRows[0]
-        const parsed = parseAdminResponse(adminText)
-
-        if (parsed.type === 'amount') {
-          const nominal = parsed.amount
-          const harga = parseFloat(pending.harga_renewal)
-
-          // Fetch current payment status to accumulate
-          const [currentStatus] = await db.query('SELECT paid_amount FROM pelunasan WHERE nama_website = ?', [pending.nama_website])
-          const existingPaid = currentStatus.length > 0 ? parseFloat(currentStatus[0].paid_amount) : 0
-          const totalPaid = existingPaid + nominal
-          const remaining = harga - totalPaid
-
-          const formattedNominal = nominal.toLocaleString('id-ID')
-          const formattedTotal = totalPaid.toLocaleString('id-ID')
-          const formattedHarga = harga.toLocaleString('id-ID')
-
-          if (totalPaid >= harga) {
-            await db.query(
-              `UPDATE pelunasan SET status = 'sudah_bayar', paid_amount = ?, remaining_amount = 0, is_complete = 1, updated_at = NOW() WHERE nama_website = ?`,
-              [totalPaid, pending.nama_website]
-            )
-            await sendSafe(sock, from, { text: `✅ *Status Diperbarui: LUNAS*\n\n🏢 Client: ${pending.nama_website}\n💵 Transfer Baru: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n✔ Pembayaran penuh terkonfirmasi.` })
-          } else {
-            const sisa = remaining
-            await db.query(
-              `UPDATE pelunasan SET status = 'kurang_bayar', paid_amount = ?, remaining_amount = ?, is_complete = 0, updated_at = NOW() WHERE nama_website = ?`,
-              [totalPaid, sisa, pending.nama_website]
-            )
-            await sendSafe(sock, from, { text: `⚠️ *Status Diperbarui: KURANG BAYAR*\n\n🏢 Client: ${pending.nama_website}\n💵 Transfer Baru: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n📉 Tagihan: Rp ${formattedHarga}\n🔴 Sisa: Rp ${sisa.toLocaleString('id-ID')}` })
-          }
-
-          await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
-          console.log(chalk.green(`✅ Admin provided amount ${nominal} for ${pending.nama_website}`))
-          return
-        }
+      // Check for a pending confirmation (Prefer matching quotedStanzaId, fall back to latest)
+      let pending = null
+      if (quotedStanzaId) {
+        const [matchedRows] = await db.query(
+          'SELECT * FROM pending_confirmations WHERE last_notify_msg_id = ? LIMIT 1',
+          [quotedStanzaId]
+        )
+        if (matchedRows.length > 0) pending = matchedRows[0]
       }
 
-      // Check normal pending confirmation (awaiting 'Sudah'/'Belum')
-      const [pendingRows] = await db.query(
-        'SELECT * FROM pending_confirmations WHERE awaiting_amount = 0 ORDER BY created_at DESC LIMIT 1'
-      )
+      if (!pending) {
+        const [latestRows] = await db.query(
+          'SELECT * FROM pending_confirmations ORDER BY created_at DESC LIMIT 1'
+        )
+        if (latestRows.length > 0) pending = latestRows[0]
+      }
 
-      if (pendingRows.length > 0) {
-        const pending = pendingRows[0]
+      if (pending) {
         const parsed = parseAdminResponse(adminText)
 
-        if (parsed.type === 'sudah') {
-          const nominal = parseFloat(pending.jumlah_transfer)
-          const harga = parseFloat(pending.harga_renewal)
+        // Case A: Awaiting specific amount (from previous interaction)
+        if (pending.awaiting_amount === 1) {
+          if (parsed.type === 'amount') {
 
-          // Edge case: AI did not detect amount
-          if (nominal === 0) {
-            await db.query('UPDATE pending_confirmations SET awaiting_amount = 1 WHERE id = ?', [pending.id])
-            await sendSafe(sock, from, { text: `🔢 Nominal tidak terdeteksi dari bukti transfer *${pending.nama_website}*.\n\nBerapa jumlah yang sudah masuk? (ketik angka, contoh: 500000)` })
-            console.log(chalk.yellow(`⚠️ AI amount=0 for ${pending.nama_website}, asking admin for amount`))
+            const nominal = Number(parsed.amount || 0)
+            const namaWeb = pending.nama_website
+
+            const [rows] = await db.query(
+              'SELECT paid_amount, harga_renewal FROM pelunasan WHERE nama_website = ?',
+              [namaWeb]
+            )
+            if (rows.length > 0) {
+
+              const currentPaid = Number(rows[0].paid_amount || 0)
+              const harga = Number(rows[0].harga_renewal || 0)
+
+              const newPaid = currentPaid + nominal
+              const newRemaining = harga - newPaid > 0 ? harga - newPaid : 0
+
+              const newStatus = newRemaining === 0 ? 'sudah_bayar' : 'kurang_bayar'
+              const isComplete = newRemaining === 0 ? 1 : 0
+              await db.query(
+                `UPDATE pelunasan 
+         SET paid_amount = ?,
+             remaining_amount = ?,
+             status = ?,
+             is_complete = ?,
+             updated_at = NOW() 
+         WHERE nama_website = ?`,
+                [newPaid, newRemaining, newStatus, isComplete, namaWeb]
+              )
+            }
+            // Fetch final state for notification
+            const [updated] = await db.query('SELECT harga_renewal, paid_amount, remaining_amount, status FROM pelunasan WHERE nama_website = ?', [namaWeb])
+
+            if (updated.length > 0) {
+              const final = updated[0]
+              const formattedNominal = nominal.toLocaleString('id-ID')
+              const formattedTotal = parseFloat(final.paid_amount).toLocaleString('id-ID')
+              const formattedHarga = parseFloat(final.harga_renewal).toLocaleString('id-ID')
+              const formattedSisa = parseFloat(final.remaining_amount).toLocaleString('id-ID')
+
+              if (final.status === 'sudah_bayar') {
+                await sendSafe(sock, from, { text: `✅ *Status Diperbarui: LUNAS*\n\n🏢 Client: ${namaWeb}\n💵 Transfer Baru: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n✔ Pembayaran penuh terkonfirmasi.` })
+              } else {
+                await sendSafe(sock, from, { text: `⚠️ *Status Diperbarui: KURANG BAYAR*\n\n🏢 Client: ${namaWeb}\n💵 Transfer Baru: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n📉 Tagihan: Rp ${formattedHarga}\n🔴 Sisa Tagihan: Rp ${formattedSisa}` })
+              }
+            }
+
+            await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
+            console.log(chalk.green(`✅ Admin provided amount ${nominal} for ${namaWeb}`))
             return
           }
-
-          // Fetch current payment status to accumulate
-          const [currentStatus] = await db.query('SELECT paid_amount FROM pelunasan WHERE nama_website = ?', [pending.nama_website])
-          const existingPaid = currentStatus.length > 0 ? parseFloat(currentStatus[0].paid_amount) : 0
-          const totalPaid = existingPaid + nominal
-          const remaining = harga - totalPaid
-
-          const formattedNominal = nominal.toLocaleString('id-ID')
-          const formattedTotal = totalPaid.toLocaleString('id-ID')
-          const formattedHarga = harga.toLocaleString('id-ID')
-
-          if (totalPaid >= harga) {
-            await db.query(
-              `UPDATE pelunasan SET status = 'sudah_bayar', paid_amount = ?, remaining_amount = 0, is_complete = 1, updated_at = NOW() WHERE nama_website = ?`,
-              [totalPaid, pending.nama_website]
-            )
-            await sendSafe(sock, from, { text: `✅ *Status Diperbarui: LUNAS*\n\n🏢 Client: ${pending.nama_website}\n💵 Transfer: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n✔ Pembayaran penuh terkonfirmasi.` })
-          } else {
-            const sisa = remaining
-            await db.query(
-              `UPDATE pelunasan SET status = 'kurang_bayar', paid_amount = ?, remaining_amount = ?, is_complete = 0, updated_at = NOW() WHERE nama_website = ?`,
-              [totalPaid, sisa, pending.nama_website]
-            )
-            await sendSafe(sock, from, { text: `⚠️ *Status Diperbarui: KURANG BAYAR*\n\n🏢 Client: ${pending.nama_website}\n💵 Transfer: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n📉 Tagihan: Rp ${formattedHarga}\n🔴 Sisa: Rp ${sisa.toLocaleString('id-ID')}` })
-          }
-
-          await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
-          console.log(chalk.green(`✅ Admin confirmed payment for ${pending.nama_website}`))
-          return
-
-        } else if (parsed.type === 'belum') {
-          await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
-          await sendSafe(sock, from, { text: `📋 Dicatat. Status *${pending.nama_website}* tetap menunggu pembayaran.` })
-          console.log(chalk.yellow(`⚠️ Admin confirmed NOT received for ${pending.nama_website}`))
-          return
         }
-        // If type is 'unknown', fall through (admin sent something else)
+
+        // Case B: Final Confirmation (Sudah/Belum)
+        if (pending.awaiting_amount === 0) {
+          if (parsed.type === 'sudah') {
+            const nominal = parseFloat(pending.jumlah_transfer)
+            const namaWeb = pending.nama_website
+
+            // Edge case: AI did not detect amount
+            if (nominal === 0) {
+              await db.query('UPDATE pending_confirmations SET awaiting_amount = 1 WHERE id = ?', [pending.id])
+              await sendSafe(sock, from, { text: `🔢 Nominal tidak terdeteksi dari bukti transfer *${namaWeb}*.\n\nBerapa jumlah yang sudah masuk? (ketik angka, contoh: 500000)` })
+              console.log(chalk.yellow(`⚠️ AI amount=0 for ${namaWeb}, asking admin for amount`))
+              return
+            }
+
+            // 1. Fetch current state
+            const [rows] = await db.query('SELECT paid_amount, harga_renewal FROM pelunasan WHERE nama_website = ?', [namaWeb])
+            if (rows.length > 0) {
+              const currentPaid = parseFloat(rows[0].paid_amount || 0)
+              const harga = parseFloat(rows[0].harga_renewal || 0)
+              const newPaid = currentPaid + nominal
+              const newRemaining = Math.max(0, harga - newPaid)
+              const newStatus = newPaid >= harga ? 'sudah_bayar' : 'kurang_bayar'
+              const isComplete = newPaid >= harga ? 1 : 0
+
+              // 2. Update with calculated values
+              await db.query(
+                `UPDATE pelunasan 
+                 SET paid_amount = ?,
+                     remaining_amount = ?,
+                     status = ?,
+                     is_complete = ?,
+                     updated_at = NOW() 
+                 WHERE nama_website = ?`,
+                [newPaid, newRemaining, newStatus, isComplete, namaWeb]
+              )
+            }
+
+            // Fetch final state for notification
+            const [updated] = await db.query('SELECT harga_renewal, paid_amount, remaining_amount, status FROM pelunasan WHERE nama_website = ?', [namaWeb])
+
+            if (updated.length > 0) {
+              const final = updated[0]
+              const formattedNominal = nominal.toLocaleString('id-ID')
+              const formattedTotal = parseFloat(final.paid_amount).toLocaleString('id-ID')
+              const formattedHarga = parseFloat(final.harga_renewal).toLocaleString('id-ID')
+              const formattedSisa = parseFloat(final.remaining_amount).toLocaleString('id-ID')
+
+              if (final.status === 'sudah_bayar') {
+                await sendSafe(sock, from, { text: `✅ *Status Diperbarui: LUNAS*\n\n🏢 Client: ${namaWeb}\n💵 Transfer: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n✔ Pembayaran penuh terkonfirmasi.` })
+              } else {
+                await sendSafe(sock, from, { text: `⚠️ *Status Diperbarui: KURANG BAYAR*\n\n🏢 Client: ${namaWeb}\n💵 Transfer: Rp ${formattedNominal}\n💰 Total Dibayar: Rp ${formattedTotal}\n📉 Tagihan: Rp ${formattedHarga}\n🔴 Sisa Tagihan: Rp ${formattedSisa}` })
+              }
+            }
+
+            await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
+            console.log(chalk.green(`✅ Admin confirmed payment for ${namaWeb}`))
+            return
+
+          } else if (parsed.type === 'belum') {
+            await db.query('DELETE FROM pending_confirmations WHERE id = ?', [pending.id])
+            await sendSafe(sock, from, { text: `📋 Dicatat. Status *${pending.nama_website}* tetap menunggu pembayaran.` })
+            console.log(chalk.yellow(`⚠️ Admin confirmed NOT received for ${pending.nama_website}`))
+            return
+          }
+          // If type is 'unknown', fall through (admin sent something else)
+        }
       }
-      return // Admin message but no active pending confirmation or unrecognized, ignore
     }
     // ===== END ADMIN HANDLER =====
 
@@ -296,6 +421,36 @@ async function startBot() {
             resolvedPhone = lidRows[0].nomor_telepon
             lidToPhoneMap[senderId] = resolvedPhone
             hasHistory = true
+          } else {
+            // LID tidak ada di mapping — coba resolve dari contextInfo (reply ke reminder)
+            const contextInfo = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo || null
+            const quotedStanzaId = contextInfo?.stanzaId
+
+            if (quotedStanzaId && sentMessageMap[quotedStanzaId]) {
+              // Client membalas reminder kita! Match LID dari stanzaId
+              resolvedPhone = sentMessageMap[quotedStanzaId]
+              lidToPhoneMap[senderId] = resolvedPhone
+              await saveLidMapping(senderId, resolvedPhone)
+              delete sentMessageMap[quotedStanzaId]
+              hasHistory = true
+              console.log(chalk.green(`📎 Resolved LID from reply: ${senderId} → ${resolvedPhone}`))
+            } else {
+              // Last resort: cek apakah hanya ada 1 client yang belum punya LID mapping
+              const [unmapped] = await db.query(`
+                SELECT p.nomor_telepon, p.nama_website FROM pelunasan p 
+                WHERE p.status IN ('menunggu_pembayaran', 'kurang_bayar')
+                  AND p.nomor_telepon NOT IN (SELECT nomor_telepon FROM lid_mapping)
+              `)
+              if (unmapped.length === 1) {
+                resolvedPhone = unmapped[0].nomor_telepon
+                lidToPhoneMap[senderId] = resolvedPhone
+                await saveLidMapping(senderId, resolvedPhone)
+                hasHistory = true
+                console.log(chalk.green(`📎 Auto-mapped LID (only 1 unmapped client): ${senderId} → ${resolvedPhone} (${unmapped[0].nama_website})`))
+              } else {
+                console.log(chalk.yellow(`⚠️ Unknown LID ${senderId} — ${unmapped.length} unmapped clients, cannot auto-resolve`))
+              }
+            }
           }
         }
       } else {
@@ -311,8 +466,12 @@ async function startBot() {
       )
 
       // 3. APPLY FILTER: Only process if active client OR has historical reminder record
-      if (clients.length === 0 && !hasHistory) {
-        // console.log(chalk.gray(`🔇 Ignoring message from unknown/untracked contact: ${from}`))
+      console.log(chalk.cyan(`🔍 DEBUG: resolvedPhone=${resolvedPhone}, clients.length=${clients.length}, hasHistory=${hasHistory}`))
+
+      const isSpecialNumber = resolvedPhone === '6287862070932' || resolvedPhone === adminPhone;
+
+      if (clients.length === 0 && !hasHistory && !isSpecialNumber) {
+        console.log(chalk.yellow(`🔇 DEBUG: ⚠️ DROPPED! Client not found in pelunasan & no LID history. resolvedPhone=${resolvedPhone}, from=${from}`))
         return
       }
 
@@ -373,12 +532,29 @@ async function startBot() {
           const formattedBilled = billedAmount.toLocaleString('id-ID')
           const formattedTransferred = transferredAmount.toLocaleString('id-ID')
 
-          let paymentStatusText = ""
-          if (transferredAmount >= billedAmount) {
-            paymentStatusText = "✅ *Status Pembayaran:* LUNAS"
+          // Fetch LATEST payment status for the notification context
+          const [currentStatus] = await db.query('SELECT paid_amount, remaining_amount, harga_renewal FROM pelunasan WHERE nama_website = ?', [namaWebsite])
+          const existingPaid = currentStatus.length > 0 ? parseFloat(currentStatus[0].paid_amount || 0) : 0
+
+          let currentRemaining = billedAmount;
+          if (currentStatus.length > 0) {
+            // If we have a record, use remaining_amount if NOT NULL, else calc from paid
+            if (currentStatus[0].remaining_amount !== null) {
+              currentRemaining = parseFloat(currentStatus[0].remaining_amount);
+            } else {
+              currentRemaining = billedAmount - existingPaid;
+            }
+          }
+
+          if (isValid) {
+            const diffAfterThis = currentRemaining - transferredAmount
+            if (diffAfterThis <= 0) {
+              paymentStatusText = `✅ *Status:* LUNAS (Setelah konfirmasi)`
+            } else {
+              paymentStatusText = `⚠️ *Status:* KURANG BAYAR\n🔴 *Sisa Tagihan:* Rp ${diffAfterThis.toLocaleString('id-ID')}\n💰 *Sudah Terbayar:* Rp ${existingPaid.toLocaleString('id-ID')}`
+            }
           } else {
-            const diff = billedAmount - transferredAmount
-            paymentStatusText = `⚠️ *Sisa Kurang:* Rp ${diff.toLocaleString('id-ID')}`
+            paymentStatusText = `❌ *Bukti Tidak Valid* (Sisa Tagihan: Rp ${currentRemaining.toLocaleString('id-ID')})`
           }
 
           const headerText = isValid ? 'NOTIFIKASI TRANSFER BARU (TRANSFER VALID)' : 'NOTIFIKASI TRANSFER BARU (TRANSFER TIDAK VALID)'
@@ -442,21 +618,23 @@ ${paymentStatusText}
 Sudah masuk ke rekening?
 
 ✏️ Balas: *Sudah* atau *Belum*
-_(Bot akan otomatis menentukan lunas/kurang berdasarkan nominal bukti transfer)_`
+_(Bot akan otomatis mengakumulasi ke sisa tagihan)_`
 
-          await sock.sendMessage(adminNumber, {
+          const sentAdminMsg = await sock.sendMessage(adminNumber, {
             image: buffer,
             caption: adminNotifyText + confirmationPrompt
           })
 
+          const lastNotifyId = sentAdminMsg?.key?.id || null
+
           // Save to pending_confirmations for admin reply tracking
           await db.query(
-            `INSERT INTO pending_confirmations (nomor_telepon_client, nama_website, jumlah_transfer, harga_renewal, is_valid, expires_at)
-             VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
-            [resolvedPhone, namaWebsite, aiAmount || 0, billedAmount, isValid ? 1 : 0]
+            `INSERT INTO pending_confirmations (nomor_telepon_client, nama_website, jumlah_transfer, harga_renewal, is_valid, last_notify_msg_id, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
+            [resolvedPhone, namaWebsite, aiAmount || 0, billedAmount, isValid ? 1 : 0, lastNotifyId]
           )
 
-          console.log(chalk.blue(`    📲 Admin notified via WhatsApp (${adminNumber}). Awaiting confirmation.`))
+          console.log(chalk.blue(`    📲 Admin notified via WhatsApp (${adminNumber}) [msgId=${lastNotifyId}]. Awaiting confirmation.`))
         } catch (downloadErr) {
           console.error(chalk.red(`    ❌ Failed to process media: ${downloadErr.message}`))
         }
@@ -475,15 +653,17 @@ _(Bot akan otomatis menentukan lunas/kurang berdasarkan nominal bukti transfer)_
         console.log("")
 
         // Save to database
+        console.log(chalk.green(`💾 DEBUG: Saving to client_responses → website=${namaWebsite}, phone=${resolvedPhone}, type=${responseType}`))
         await db.query(
           `INSERT INTO client_responses (nama_website, nomor_telepon, message_text, response_type, received_at) 
            VALUES (?, ?, ?, ?, NOW())`,
           [namaWebsite, resolvedPhone, text, responseType]
         )
+        console.log(chalk.green(`✅ DEBUG: client_responses INSERT success!`))
       }
 
     } catch (err) {
-      console.error(chalk.red("❌ Error processing message:"), err.message)
+      console.error(chalk.red("❌ Error processing message:"), err.message, err.stack)
     }
 
     if (text.toLowerCase() === "ping") await sendSafe(sock, from, { text: "pong 🏓" })
@@ -495,12 +675,14 @@ async function checkAndSendReminders() {
   isReminderRunning = true
   try {
     console.log(chalk.cyan("🔍 Checking for pending reminders..."))
+
+    const reminderDays = (process.env.REMINDER_DAYS || "7,3,1,0,-3").split(",").map(d => parseInt(d.trim()))
     const [rows] = await db.query(`
       SELECT *, DATEDIFF(due_date, CURDATE()) AS diff FROM pelunasan
-      WHERE status = 'menunggu_pembayaran' AND due_date IS NOT NULL
+      WHERE status IN ('menunggu_pembayaran', 'kurang_bayar') AND due_date IS NOT NULL
         AND (last_reminder_sent IS NULL OR DATE(last_reminder_sent) < CURDATE())
-        AND DATEDIFF(due_date, CURDATE()) IN (7, 3, 1, 0, -3)
-    `)
+        AND DATEDIFF(due_date, CURDATE()) IN (?)
+    `, [reminderDays])
 
     if (!rows.length) {
       console.log(chalk.gray("📭 No pending reminders."))
@@ -508,20 +690,50 @@ async function checkAndSendReminders() {
     }
 
     for (const row of rows) {
-      const text = getReminderText(row.nama_website, formatToIndonesianDate(row.due_date), row.paket, row.harga_renewal, row.diff)
+      // Pass paid_amount and remaining_amount to getReminderText
+      const text = getReminderText(
+        row.nama_website,
+        formatToIndonesianDate(row.due_date),
+        row.paket,
+        row.harga_renewal,
+        row.diff,
+        parseFloat(row.paid_amount || 0),
+        parseFloat(row.remaining_amount || 0)
+      )
       const sendResult = await sendSafe(sock, `${row.nomor_telepon}@s.whatsapp.net`, { text })
 
-      if (sendResult?.key?.remoteJid?.endsWith('@lid')) {
-        const lid = sendResult.key.remoteJid.replace('@lid', '')
-        lidToPhoneMap[lid] = row.nomor_telepon
-        await saveLidMapping(lid, row.nomor_telepon)
+      // Track message ID untuk LID mapping via reply/fromMe
+      if (sendResult?.key?.id) {
+        sentMessageMap[sendResult.key.id] = row.nomor_telepon
+        console.log(chalk.cyan(`    📎 Tracking msgId=${sendResult.key.id} → ${row.nomor_telepon}`))
       }
 
+      // Langsung capture LID jika ada di sendResult
+      if (sendResult?.key?.remoteJid?.endsWith('@lid')) {
+        const lid = sendResult.key.remoteJid.replace('@lid', '')
+        if (!lidToPhoneMap[lid]) {
+          lidToPhoneMap[lid] = row.nomor_telepon
+          await saveLidMapping(lid, row.nomor_telepon)
+          console.log(chalk.green(`    📎 LID Mapping from sendResult: ${lid} → ${row.nomor_telepon}`))
+        }
+      }
+
+      const reminderLabel = row.diff === 0 ? 'H0' : (row.diff < 0 ? `H+${Math.abs(row.diff)}` : `H-${row.diff}`)
+      let reminderCounts = { '7': 1, '3': 2, '1': 3, '0': 4, '-3': 5 }
+      try {
+        if (process.env.REMINDER_COUNTS_JSON) {
+          reminderCounts = JSON.parse(process.env.REMINDER_COUNTS_JSON)
+        }
+      } catch (err) {
+        console.error(chalk.red("❌ Failed to parse REMINDER_COUNTS_JSON:"), err.message)
+      }
+      const newCount = reminderCounts[row.diff.toString()] || (row.reminder_count + 1)
+
       await db.query(
-        `UPDATE pelunasan SET last_reminder_sent = NOW(), reminder_count = reminder_count + 1, last_reminder_type = ?, updated_at = NOW() WHERE nama_website = ?`,
-        [`H${row.diff >= 0 ? '+' : ''}${row.diff}`, row.nama_website]
+        `UPDATE pelunasan SET last_reminder_sent = NOW(), reminder_count = ?, last_reminder_type = ?, updated_at = NOW() WHERE nama_website = ?`,
+        [newCount, reminderLabel, row.nama_website]
       )
-      console.log(chalk.green(`📤 Reminder sent to ${row.nama_website} (H${row.diff})`))
+      console.log(chalk.green(`📤 Reminder sent to ${row.nama_website} (${reminderLabel}) [Count: ${newCount}]`))
     }
   } catch (err) {
     // console.error("❌ Reminder error:", err.message)
@@ -530,9 +742,40 @@ async function checkAndSendReminders() {
   }
 }
 
+async function checkAndDeactivateClients() {
+  if (!isConnected) return
+  try {
+    const deactivationDays = parseInt(process.env.DEACTIVATION_THRESHOLD_DAYS || "3")
+    const [rows] = await db.query(`
+      SELECT p.id, p.nama_website, p.nomor_telepon FROM pelunasan p
+      LEFT JOIN client_responses r ON p.nama_website = r.nama_website 
+         AND r.received_at > p.last_reminder_sent
+      WHERE p.status IN ('menunggu_pembayaran', 'kurang_bayar') 
+        AND DATEDIFF(p.due_date, CURDATE()) < ?
+        AND p.last_reminder_sent IS NOT NULL
+        AND r.response_id IS NULL
+    `, [-deactivationDays])
+
+    for (const row of rows) {
+      await db.query("UPDATE pelunasan SET status = 'nonaktif', updated_at = NOW() WHERE id = ?", [row.id])
+      console.log(chalk.red(`🚫 Automatically deactivated ${row.nama_website} (No response after H+3)`))
+
+      // Notify Admin
+      await sendSafe(sock, adminNumber, { text: `🚫 *NONAKTIF OTOMATIS*\n\nClient *${row.nama_website}* (${row.nomor_telepon}) telah dinonaktifkan karena tidak ada respon setelah reminder H+3.` })
+    }
+  } catch (err) {
+    console.error(chalk.red("❌ Deactivation loop error:"), err.message)
+  }
+}
+
 function startReminderLoop() {
   checkAndSendReminders()
-  reminderInterval = setInterval(checkAndSendReminders, 60_000)
+  checkAndDeactivateClients()
+  const interval = parseInt(process.env.REMINDER_LOOP_MS || "60000")
+  reminderInterval = setInterval(() => {
+    checkAndSendReminders()
+    checkAndDeactivateClients()
+  }, interval)
 }
 
 startBot()

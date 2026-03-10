@@ -74,16 +74,6 @@ CREATE TABLE IF NOT EXISTS lid_mapping (
   INDEX idx_nomor_telepon (nomor_telepon)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Mapping WhatsApp LID ke nomor telepon';
 
--- =====================================================
--- Insert data dummy untuk testing (OPTIONAL - jalankan manual jika diperlukan)
--- =====================================================
-
--- Uncomment untuk insert data dummy:
--- INSERT INTO pelunasan (nama_website, nomor_telepon, paket, harga_renewal, tahun_ke, status, due_date) VALUES
--- ('okosukses.com', '6287862070932', 'profesional', 1500000, 1, 'menunggu_pembayaran', DATE_ADD(CURDATE(), INTERVAL 7 DAY)),
--- ('asadesain.id', '6289648211444', 'hemat', 750000, 2, 'aktif', DATE_ADD(CURDATE(), INTERVAL 30 DAY)),
--- ('kulinerhits.co', '6285842903319', 'bisnis', 1200000, 1, 'menunggu_pembayaran', DATE_ADD(CURDATE(), INTERVAL 3 DAY)),
--- ('travelceria.net', '6285701950701', 'expert', 2000000, 3, 'expired', DATE_SUB(CURDATE(), INTERVAL 1 DAY)),
--- ('pelanjamurah.store', '6289603166370', 'hemat', 500000, 1, 'menunggu_pembayaran', CURDATE());
+-- Database structure initialized.
 
 SELECT 'Database and tables created successfully!' AS Status;

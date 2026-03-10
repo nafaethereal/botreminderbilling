@@ -1,10 +1,10 @@
 const mysql = require("mysql2/promise")
 
 const db = mysql.createPool({
-  host: "localhost",
-  user: "root",
-  password: "",        // default Laragon
-  database: "dummy_reminder",
+  host: process.env.DB_HOST || "localhost",
+  user: process.env.DB_USER || "root",
+  password: process.env.DB_PASS || "",
+  database: process.env.DB_NAME || "dummy_reminder",
   waitForConnections: true,
   connectionLimit: 5,
   queueLimit: 0

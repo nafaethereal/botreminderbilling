@@ -8,8 +8,12 @@ let queue = Promise.resolve()
 function sendSafe(sock, jid, message) {
   queue = queue.then(async () => {
     await delay(RATE_DELAY)
-    return await sock.sendMessage(jid, message)
-  }).catch(console.error)
+    const result = await sock.sendMessage(jid, message)
+    return result
+  }).catch(err => {
+    console.error(err)
+    return null // Return null instead of undefined so caller knows it failed
+  })
 
   return queue
 }

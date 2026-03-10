@@ -11,3 +11,9 @@ Thumbs.db
 
 session-data/
 transfers/
+scripts/
+tmp/
+_reset.js
+_setup.js
+*.php
+database/
